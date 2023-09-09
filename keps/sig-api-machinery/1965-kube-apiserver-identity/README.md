@@ -68,7 +68,7 @@ list of IDs for living kube-apiservers in the cluster.
 
 ## Motivation
 
-The [dynamic coordinated storage version API](https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/20190802-dynamic-coordinated-storage-version.md#curating-a-list-of-participating-api-servers-in-ha-master)
+The [dynamic coordinated storage version API](https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/2339-storageversion-api-for-ha-api-servers/README.md#curating-a-list-of-participating-api-servers-in-ha-master)
 needs such a list to garbage collect stale records. The
 [API priority and fairness feature](https://github.com/kubernetes/kubernetes/pull/91389)
 needs a unique identifier for an apiserver reporting its concurrency limit.
@@ -139,7 +139,9 @@ ownership churn of the lease. All kube-apiserver leases will also have a compone
 In the future, we may consider providing a flag in `kube-apiserver` to override the lease name, but we don't anticipate
 needing this today.
 
-
+<!--
+**TODO:** Add justification for adding version information in apiserver Identity Lease.
+-->
 ### Test Plan
 
 [X] I/we understand the owners of the involved components may require updates to
@@ -179,7 +181,10 @@ Alpha should provide basic functionality covered with tests described above.
 
 #### Beta -> GA Graduation
 
-==TODO==
+  - Add version information to kube-apiserver identity Lease
+  - Update tests to check for version information in the Lease
+  - Promote e2e test to conformance
+
 
 **For non-optional features moving to GA, the graduation criteria must include
 [conformance tests].**
