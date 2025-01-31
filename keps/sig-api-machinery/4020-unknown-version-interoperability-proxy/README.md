@@ -24,7 +24,6 @@ tags, and then generate with `hack/update-toc.sh`.
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
   - [Aggregation Layer](#aggregation-layer)
-    - [StorageVersion enhancement needed](#storageversion-enhancement-needed)
     - [Identifying destination apiserver's network location](#identifying-destination-apiservers-network-location)
     - [Proxy transport between apiservers and authn](#proxy-transport-between-apiservers-and-authn)
   - [Discovery Merging](#discovery-merging)
@@ -136,39 +135,41 @@ incorrectly or objects being garbage collected mistakenly.
 
 ## Proposal
 
-We will use the existing `StorageVersion` API to figure out which group, versions,
-and resources an apiserver can serve.
+We will use the existing [Aggregated Discovery](https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/3352-aggregated-discovery/README.md) mechanism to fetch which group, versions and resources an apiserver can serve.
 
 
 API server change:
 * A new handler is added to the stack:
 
-  - If the request is for a group/version/resource the apiserver doesn't have
-    locally (we can use the StorageVersion API), it will proxy the request to
-    one of the apiservers that is listed in the [ServerStorageVersion](https://github.com/kubernetes/kubernetes/blob/release-1.27/pkg/apis/apiserverinternal/types.go#L64) object. If an apiserver fails
-    to respond, then we will return a 503 (there is a small
-    possibility of a race between the controller registering the apiserver
-    with the resources it can serve and receiving a request for a resource
-    that is not yet available on that apiserver).
+  - A new handler is added to the stack:
+If a request targets a group/version/resource the apiserver doesn't serve locally (requiring a discovery request, which could be optimized with caching), the apiserver will consult its informer cache of peer apiservers. This cache is populated and updated by an informer on apiserver lease objects.  The informer's event handler performs remote discovery calls to each peer apiserver when its lease object is added or updated, ensuring the cache reflects the current state of each peer's served resources.  The apiserver uses this cache to identify which peer serves the requested resource. Once it figures out a suitable peer to route the request to, it will proxy the request to that server. If that apiserver fails to respond, then we will return a 503 (there is a small possibility of a race between the controller registering the apiserver with the resources it can serve and receiving a request for a resource that is not yet available on that apiserver).
 
 * Discovery merging:
 
   - During upgrade or downgrade, it may be the case that no apiserver has a
     complete list of available resources. To fix the problems mentioned, it's
     necessary that discovery exactly matches the capability of the system. So,
-    we will use the storage version objects to reconstruct a merged discovery
+    we will use the remote [aggregate-discovery](https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/3352-aggregated-discovery/README.md) calls to peer apiserver to reconstruct a merged discovery
     document and serve that in all apiservers.
 
-Why so much work?
-* Note that merely serving 503s at the right times does not solve the problem,
-  for two reasons: controllers might get an incomplete discovery and therefore
-  not ask about all the correct resources; and when they get 503 responses,
-  although the controller can avoid doing something destructive, it also can't
-  make progress and is stuck for the duration of the upgrade.
-* Likewise proxying but not merging the discovery document, or merging the
-  discovery document but serving 503s instead of proxying, doesn't fix the
-  problem completely. We need both safety against destructive actions and the
-  ability for controllers to proceed and not block.
+    Why so much work?
+    * Note that merely serving 503s at the right times does not solve the problem,
+      for two reasons: controllers might get an incomplete discovery and therefore
+      not ask about all the correct resources; and when they get 503 responses,
+      although the controller can avoid doing something destructive, it also can't
+      make progress and is stuck for the duration of the upgrade.
+    * Likewise proxying but not merging the discovery document, or merging the
+      discovery document but serving 503s instead of proxying, doesn't fix the
+      problem completely. We need both safety against destructive actions and the
+      ability for controllers to proceed and not block.
+
+* Version Aware Proxying:
+
+  - With [compatibility versions](https://github.com/kubernetes/enhancements/blob/master/keps/sig-architecture/4330-compatibility-versions/README.md) information available for kubernetes components, we can leverage that to perform version aware proxying between API servers, and ensure that a request is proxied to an eligible apiserver given that it was generated by a client compatible with the apiserver/s present in a cluster. Version aware proxying lets us ensure that requests from clients (possibly) expecting to use a feature introduced in later K8s versions,  are not incorrectly routed to apiservers at older versions
+
+  - We will add a new header in client requests to specify the compatibility version of the client 
+
+  - We will publish [min-compatibility version](https://github.com/kubernetes/enhancements/blob/master/keps/sig-architecture/4330-compatibility-versions/README.md#--min-compatibility-version), binary-version of an apiserver as annotations in the apiserver-identity lease
 
 ### User Stories (Optional)
 
@@ -176,7 +177,7 @@ Why so much work?
 
 The garbage collector makes decisions about deleting objects when all
 referencing objects are deleted. A discovery gap / apiserver mismatch, as
-described above, could result in GC seeing a 404 and assuming an object has been
+described above, could result in garbage collector seeing a 404 and assuming an object has been
 deleted; this could result in it deleting a subsequent object that it should
 not.
 
@@ -240,49 +241,27 @@ This might be a good place to talk about core concepts and how they relate.
 
 ![Alt text](https://user-images.githubusercontent.com/26771552/244544622-8ade44db-b22b-4f26-880d-3eee5bc1f913.png?raw=true "Optional Title")
 
-1. A new filter will be added to the [handler chain] of the aggregation layer. This filter will maintain an internal map with the key being the group-version-resource and the value being a list of server IDs of apiservers that are capable of serving that group-version-resource
-   1. This internal map is populated using an informer for StorageVersion objects. An event handler will be added for this informer that will get the apiserver ID of the requested group-version-resource and update the internal map accordingly
+1. A new filter will be added to the [handler chain] of the aggregation layer. This filter will maintain the following internal caches:
+
+    1. a map that stores the resources served by the local apiserver for a group-version(Local Discovery cache). This will be done via a discovery call using a loopback client. A post-start hook will populate this cache, guaranteeing the apiserver has a complete view of its served resources before processing any incoming requests.
+    2. an informer cache of resources served by each peer apiserver in the cluster(Remote Discovery cache). This cache will be updated by an informer on [apiserver identity Lease objects](https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/1965-kube-apiserver-identity/README.md#proposal). The informer's event handler will make remote discovery calls to peer apiservers whose lease objects are added or updated. 
 
 2. This filter will pass on the request to the next handler in the local aggregator chain, if:
    1. It is a non resource request
-   2. The StorageVersion informer cache hasn't synced yet or if `StorageVersionManager.Completed()` has returned false. We will serve error 503 in this case
+   2. The Local Discovery cache or the Remote Discovery cache hasn't synced yet. We will serve error 503 in this case
    3. The request has a header `X-Kubernetes-APIServer-Rerouted:true` that indicates that this request has been proxied once already. If for some reason the resource is not found locally, we will serve error 503
-   4. No StorageVersion was retrieved for it, meaning the request is for an aggregated API or for a custom resource
-   5. If the local apiserver ID is found in the list of serviceable-by server IDs from the internal map
+   4. The requested resource was listed in the Local Discovery cache
+   5. No other peer apiservers were found to exist in the cluster
 
-3. If the local apiserver ID is not found in the list of serviceable-by server IDs, a random apiserver ID will be selected from the retrieved list and the request will be proxied to this apiserver
+3. If the requested resource was not found in the Local Discovery cache, we will try to fetch the resource from the Remote Discovery cache. The request will then be proxied to any peer apiserver thats found to be able to serve the resource as indicated in the Remote Discovery cache. 
 
-4. If there is no apiserver ID retrieved for the requested GVR, we will serve 404 with error `GVR <group_version_resource> is not served by anything in this cluster`
+4. If there is no eligible apiserver found in the Remote Discovery cache for the requested resource, we will serve 404 with error `GVR <group_version_resource> is not served by anything in this cluster`
 
 5. If the proxy call fails for network issues or any reason, we serve 503 with error `Error while proxying request to destination apiserver`
 
-6. We will also add a poststarthook for the apiserver to ensure that it does not start serving requests until we are done creating/updating SV objects
+6. We will also add a poststarthook for the apiserver to ensure that it does not start serving requests until we have populated both Local Discovery and Remote Discovery caches.
 
 [handler chain]:https://github.com/kubernetes/kubernetes/blob/fc8f5a64106c30c50ee2bbcd1d35e6cd05f63b00/staging/src/k8s.io/apiserver/pkg/server/config.go#L639
-
-#### StorageVersion enhancement needed
-
-StorageVersion API currently tells us whether a particular StorageVersion can be read from etcd by the listed apiserver. We will enhance this API to also include apiserver ID of the server that can serve this StorageVersion.
-
-With the enhancement, the new [ServerStorageVersion](https://github.com/kubernetes/kubernetes/blob/release-1.27/pkg/apis/apiserverinternal/types.go#L62-L73) object will have this structure
-
-```
-type ServerStorageVersion struct {
-  // The ID of the reporting API server.
-  APIServerID string
-	
-  // The API server encodes the object to this version 
-  // when persisting it in the backend (e.g., etcd).
-  EncodingVersion string
-
-  // The API server can decode objects encoded in these versions.
-  // The encodingVersion must be included in the decodableVersions.
-  DecodableVersions []string
-
-  // Versions that can be served by the reporting API server
-  ServedVersions []string
-}
-```
 
 #### Identifying destination apiserver's network location
 
@@ -305,7 +284,7 @@ For the mTLS between source and destination apiservers, we will do the following
 2. The server (destination apiserver) will check the client (source apiserver) certs to determine that the proxy request is from an authenticated client. We will use requestheader authentication (and NOT client cert authentication) for this. The client (source apiserver) will provide the [proxy-client certfiles](https://github.com/kubernetes/kubernetes/blob/release-1.27/cmd/kube-apiserver/app/options/options.go#L222-L233) to the server (destination apiserver) which will verify the presented certs using the CA bundle provided in the [--requestheader-client-ca-file](https://github.com/kubernetes/kubernetes/blob/release-1.27/staging/src/k8s.io/apiserver/pkg/server/options/authentication.go#L125-L128) passed to the apiserver upon bootstrap
 
 ### Discovery Merging
-TODO: detailed description of discovery merging. (not scheduled until beta.)
+Maintaining the Remote Discovery cache, which provides a merged view of all resources available in the cluster at any given time (even during mixed version state), naturally solves the problem of serving a comprehensive discovery document.
 
 ### Test Plan
 
@@ -397,6 +376,7 @@ We will test the feature mostly in integration test and unit test. We may add e2
 
 #### Beta
 
+- Version aware proying implemented
 - Discovery document merging implemented
 - Use egress dialer for network connections made to peer kube-apiservers
 
@@ -716,7 +696,6 @@ This section must be completed when targeting beta to a release.
 
 No, but it does depend on 
 
-- the `StorageVersion` feature that generates objects with a `storageVersion.status.serverStorageVersions[*].apiServerID` field which is used to find the remote apiserver's network location.
 - `APIServerIdentity` feature in kube-apiserver that creates a lease object for APIServerIdentity which we will use to store the network location of the remote apiserver for visibility/debugging
 
 <!--
@@ -761,7 +740,10 @@ Focusing mostly on:
     heartbeats, leader election, etc.)
 -->
 
-No.
+Yes, enabling this feature will result in new API calls.  Specifically:
+
+- Discovery calls via a loopback client: The local apiserver will use a loopback client to discover the resources it serves for each group-version
+- Remote discovery calls to peer apiservers: The event handler for apiserver identity lease informer will make remote discovery calls to each peer apiserver whose lease object is added or updated
 
 ###### Will enabling / using this feature result in introducing new API types?
 
@@ -806,7 +788,7 @@ Think about adding additional work or introducing new steps in between
 [existing SLIs/SLOs]: https://git.k8s.io/community/sig-scalability/slos/slos.md#kubernetes-slisslos
 -->
 
-When handling a request in the handler chain of the kube-aggregator, the StorageVersion informer will be used to look up which API servers can serve the requested resource. 
+The Local Discovery and Remote Discovery caches should take care of us not causing delays while handling a request. 
 
 ###### Will enabling / using this feature result in non-negligible increase of resource usage (CPU, RAM, disk, IO, ...) in any components?
 
